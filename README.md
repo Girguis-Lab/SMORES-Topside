@@ -12,9 +12,8 @@ See [AGENTS.md](AGENTS.md) for the full functional spec and implementation
 plan, and [ARCHITECTURE.md](ARCHITECTURE.md) for the module layout, config
 schema, and DB row layout.
 
-**Status:** complete — all 12 implementation steps are done. Every module
-is implemented, the full test suite passes, `ruff`/`mypy --strict` are clean,
-and the systemd unit in [deploy/](deploy/) is documented below.
+> [!note]
+> AI was used extensively in the development of this software.
 
 ## Initial setup of a fresh Raspberry Pi
 
@@ -190,7 +189,7 @@ console](https://login.tailscale.com/admin/machines) while you're there:
 
 ```bash
 sudo apt install -y git pipenv
-git clone https://github.com/KW-M/SMORES-Topside.git /home/pi/SMORES-Topside
+git clone https://github.com/Girguis-Lab/SMORES-Topside.git /home/pi/SMORES-Topside
 cd /home/pi/SMORES-Topside
 pipenv install --dev
 ```
