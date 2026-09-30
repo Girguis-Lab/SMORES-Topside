@@ -25,7 +25,7 @@
 # university and gives the buoy full outbound internet — which is all Tailscale
 # needs, since inbound access arrives over the Tailscale tunnel, not the campus
 # network. (If your network admin *will* route you a spare campus address, drop
-# the NAT unit and add `proxyarp` to the peers file instead.)
+# the NAT unit and add `proxyarp` to the pppd options in the link unit.)
 #
 # This is deliberately independent of the SMORES backend and of Tailscale: its
 # own systemd units, started before them, and neither knows it exists.
@@ -95,8 +95,6 @@ LCP_FAILURE="${LCP_FAILURE:-6}"
 # Seconds between redial attempts once the link is down.
 HOLDOFF="${HOLDOFF:-5}"
 
-PEER_NAME="smores-radio"
-PEER_FILE="/etc/ppp/peers/${PEER_NAME}"
 NFT_FILE="/etc/nftables.d/smores-radio-nat.nft"
 SYSCTL_FILE="/etc/sysctl.d/99-smores-radio-forward.conf"
 LINK_UNIT="smores-radio-link.service"
@@ -191,6 +189,11 @@ validate_args() {
            warn "assigned in probe order, so this will point somewhere else the"
            warn "first time the Pi boots with the adapters plugged in differently." ;;
     esac
+    # The path is written straight into the unit's ExecStart=, where systemd
+    # would read % as a specifier and whitespace as an argument break.
+    case "$RADIO_DEV" in
+        *%*|*[[:space:]]*) die "$RADIO_DEV contains % or whitespace; use a path without them" ;;
+    esac
     [ -e "$RADIO_DEV" ] || warn "$RADIO_DEV does not exist yet; the service will wait for it."
 }
 
@@ -204,86 +207,6 @@ require_tools() {
 }
 
 # ------------------------------------------------------------ file writing --
-
-write_peer_file() {
-    install -d -m 0755 /etc/ppp/peers
-    cat >"$PEER_FILE" <<EOF
-# Managed by deploy/setup_radio_link_shore.sh — regenerated on every run.
-#
-# Shore side of the RFD900x link.
-#
-# Every comment below starts at column 0 and takes a whole line. pppd's
-# options-file parser documents "lines beginning with #" as comments and
-# nothing more, so a trailing comment after an option is not safe to rely on.
-#
-# Debug a bring-up by hand with:
-#   sudo systemctl stop $LINK_UNIT
-#   sudo pppd call $PEER_NAME nodetach debug
-
-$RADIO_DEV
-$RADIO_BAUD
-
-# local:remote, both pinned. Nothing is negotiated, so either Pi may boot first
-# and neither has to be "the server".
-$SHORE_IP:$BUOY_IP
-
-# The next two override Debian's /etc/ppp/options, which pppd reads first and
-# which is written for dial-up modems. Both overrides are mandatory:
-#
-#   local  - /etc/ppp/options sets \`modem\`, so pppd waits for carrier-detect
-#            before doing anything. A USB-serial adapter wired to a radio never
-#            raises DCD, so without this the link silently never starts.
-#   noauth - /etc/ppp/options sets \`auth\`, demanding the peer prove its
-#            identity from a secrets file. This is a private two-node link that
-#            no third party can reach.
-local
-noauth
-
-# This Pi's own default route belongs to the campus ethernet; never let the
-# radio link take it.
-nodefaultroute
-
-# Flow control. See FLOW_CONTROL in the setup script: the RFD900x ships with
-# RTS/CTS off, and waiting on a CTS that never comes wedges the port silently.
-$FLOW_CONTROL
-
-# The radio is an 8-bit clean pipe, so don't spend air time escaping control
-# characters.
-asyncmap 0
-
-# Keep 1500. Tailscale's 1280-byte WireGuard packets plus their UDP/IP headers
-# must fit in one PPP frame; fragmenting them over a lossy radio turns one lost
-# fragment into a lost packet.
-mtu 1500
-mru 1500
-
-# Campus egress here is v4-only, so skip IPV6CP negotiation entirely.
-noipv6
-
-# Stay in the foreground so systemd supervises pppd directly.
-nodetach
-
-# --- staying up -------------------------------------------------------------
-# lcp-echo-* is the only thing that notices a *silent* failure: RF noise, the
-# buoy powering off, the buoy rebooting. $LCP_FAILURE unanswered echoes
-# ${LCP_INTERVAL}s apart tear the link down after ~$((LCP_INTERVAL * LCP_FAILURE))s.
-lcp-echo-interval $LCP_INTERVAL
-lcp-echo-failure $LCP_FAILURE
-
-# persist + maxfail 0 then renegotiate forever, $HOLDOFF s apart, without pppd
-# ever exiting — so a radio outage heals itself with no process restart and no
-# systemd churn. The unit's Restart=always is the outer layer, for the case
-# pppd genuinely dies (the USB adapter being yanked out).
-persist
-maxfail 0
-holdoff $HOLDOFF
-
-# Uncomment for full LCP/IPCP negotiation traces:
-#debug
-EOF
-    chmod 0644 "$PEER_FILE"
-    note "Wrote $PEER_FILE"
-}
 
 write_nat_files() {
     install -d -m 0755 /etc/sysctl.d
@@ -362,13 +285,55 @@ Type=exec
 # purpose — systemd expands \$name itself before /bin/sh ever sees it.)
 ExecStartPre=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do [ -e "$RADIO_DEV" ] && exit 0; sleep 2; done; echo "radio serial device $RADIO_DEV never appeared" >&2; exit 1'
 
-# nolog stops pppd writing every line to both stderr and syslog; journald still
-# collects the syslog copy, so 'journalctl -u $LINK_UNIT' shows everything once.
-ExecStart=/usr/sbin/pppd call $PEER_NAME nodetach nolog
+# Extra pppd options, empty by default. To trace LCP/IPCP negotiation without
+# touching this file (which the setup script regenerates):
+#   sudo systemctl edit $LINK_UNIT      ->  [Service]
+#                                           Environment=PPPD_EXTRA=debug
+Environment=PPPD_EXTRA=
 
-# The peers file's persist/maxfail already ride out RF outages and peer reboots
-# without pppd exiting. This layer is for when it does exit: the USB adapter
-# being unplugged, or a SIGTERM from 'systemctl restart'.
+# Every pppd option lives on this command line — there is no /etc/ppp/peers
+# file. pppd still reads Debian's /etc/ppp/options first; everything here
+# overrides it. systemd drops the comment lines between continued lines.
+ExecStart=/usr/sbin/pppd $RADIO_DEV $RADIO_BAUD \\
+# local:remote, both pinned. Nothing is negotiated, so either Pi may boot first
+# and neither has to be "the server".
+    $SHORE_IP:$BUOY_IP \\
+# Both override /etc/ppp/options, which is written for dial-up modems:
+#   local  - it sets 'modem', so pppd waits for carrier-detect. A USB-serial
+#            adapter wired to a radio never raises DCD, so without this the
+#            link silently never starts.
+#   noauth - it sets 'auth', demanding the peer prove its identity from a
+#            secrets file. This is a private two-node link.
+    local noauth \\
+# This Pi's default route belongs to the campus ethernet; never let the radio
+# link take it.
+    nodefaultroute \\
+# RTS/CTS. The RFD900x ships with it off (ATS14=0), and waiting on a CTS that
+# never comes wedges the port silently. crtscts needs ATS14=1 on BOTH radios.
+    $FLOW_CONTROL \\
+# The radio is an 8-bit clean pipe; don't spend air time escaping control
+# characters.
+    asyncmap 0 \\
+# Keep 1500. Tailscale's 1280-byte WireGuard packets plus UDP/IP headers must
+# fit in one PPP frame; over a lossy radio, one lost fragment loses the packet.
+    mtu 1500 mru 1500 \\
+# Campus egress here is v4-only, so skip IPV6CP negotiation entirely.
+    noipv6 \\
+# lcp-echo-* is the only thing that notices a *silent* failure: RF noise, the
+# buoy powering off or rebooting. $LCP_FAILURE unanswered echoes ${LCP_INTERVAL} s apart
+# tear the link down after ~$((LCP_INTERVAL * LCP_FAILURE)) s.
+    lcp-echo-interval $LCP_INTERVAL lcp-echo-failure $LCP_FAILURE \\
+# persist + maxfail 0 renegotiate forever, $HOLDOFF s apart, without pppd ever
+# exiting — so a radio outage heals itself with no process restart.
+    persist maxfail 0 holdoff $HOLDOFF \\
+# nodetach keeps pppd in the foreground so systemd supervises it directly.
+# nolog stops it writing every line to both stderr and syslog; journald keeps
+# the syslog copy, so 'journalctl -u $LINK_UNIT' shows everything once.
+    nodetach nolog \$PPPD_EXTRA
+
+# persist/maxfail above already ride out RF outages and peer reboots without
+# pppd exiting. This layer is for when it does exit: the USB adapter being
+# unplugged, or a SIGTERM from 'systemctl restart'.
 Restart=always
 RestartSec=5
 
@@ -393,7 +358,6 @@ do_apply() {
     validate_args
     require_tools
 
-    write_peer_file
     write_nat_files
     write_units
 
@@ -465,7 +429,7 @@ do_remove() {
     systemctl disable --now "$LINK_UNIT" >/dev/null 2>&1 || true
     systemctl disable --now "$NAT_UNIT" >/dev/null 2>&1 || true
     rm -f "/etc/systemd/system/$LINK_UNIT" "/etc/systemd/system/$NAT_UNIT"
-    rm -f "$PEER_FILE" "$NFT_FILE" "$SYSCTL_FILE"
+    rm -f "$NFT_FILE" "$SYSCTL_FILE"
     nft delete table ip smores_nat 2>/dev/null || true
     systemctl daemon-reload
     # ip_forward is left as-is in the running kernel: the sysctl.d file that set
