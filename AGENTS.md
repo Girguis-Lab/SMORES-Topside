@@ -90,5 +90,28 @@ Do not proceed to the next step until the user replies with an explicit approval
 10. Implement remaining stubs.
 11. Run the full test suite from clean slate in verbose mode - run it 5 times to verify tests leave no leftovers and are not flaky. Also run unit and integration tests separately from a clean slate to verify unit tests don't depend on integration test state and visa versa.
 12. Write systemd unit with data path env vars set to `~/SMORES_Data`, user pi. Add install & operate instructions to README.md (including systemd install & journalctl usage, Where to find live api docs, Basic API query example for CSV in date range, and csv output format example, status code meanings).
+13. Add a separate service
 
 **Definition of Done:** all tests pass, ruff/mypy clean, `ARCHITECTURE.md` matches implementation, systemd unit installs, runs without exiting and survives `systemctl restart`.
+
+### Additional deployment details:
+Given the following linear network topology:
+Internet provided by University
+|
+Ethernet cable
+|
+Raspberry Pi (AKA "Shore-Side Computer") - used as network bridge
+|
+250kbps Serial Radio Modem "A"
+|
+Radio Link
+|
+250kbps Serial Radio Modem "B"
+|
+Raspberry Pi (AKA "Remote Bouy Computer") - Runs a webserver and a tailscale reverse proxy/vpn for remote access to this webserver. Can have static or dynamic IP
+
+Seggest common linux included tools to run on each raspberry pi to enable a transparent link that allows the "Remote Bouy Computer" to access the internet as if it was connected to the university network directly. Add if services or startup routines are needed to persist this setup accross reboots and if/how this can successfuly resume a connection if for some reason one link in the chain becomes temprorarilly broken (Eg radio noise or reboot)
+
+This should be a separate service from the webserver and tailscale components, ideally with only a few commands in a shell script for each raspberrry pi
+
+Note that the serial radio modems are not yet attached to this raspberry pi, but will be RFD900x-US modems running SIK firmware with a default serial configuriation of: 57600 baud • No parity • 8 data bits • 1 stop bit However the baud rate should be configurable (eg by env var) in the implemenation
