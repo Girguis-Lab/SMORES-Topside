@@ -336,10 +336,10 @@ EOF
 
 # --------------------------------------------------------------------- DNS --
 #
-# NetworkManager owns /etc/resolv.conf on this Pi (with Tailscale's MagicDNS
-# layered on top when enabled), so the resolvers are handed to NetworkManager
-# rather than written into the file, where it would overwrite them on the next
-# interface event.
+# Normally NetworkManager owns /etc/resolv.conf, but on this Pi tailscale overwrites it
+# so  Tailscale's MagicDNS works. When networkManager owns it, the resolvers are
+# handed to NetworkManager rather than written into the file, where it would overwrite
+# them on the next interface event.
 #
 # NetworkManager only uses a connection's DNS servers while that connection is
 # active, and ppp0 is created by pppd, not NetworkManager, so it cannot carry

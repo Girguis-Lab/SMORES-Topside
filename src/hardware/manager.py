@@ -34,18 +34,25 @@ SensorFactory = Callable[[ModbusBus, int], BlueRDOInterface]
 """Builds the `BlueRDOInterface` for one (bus, address) pair."""
 
 
-def estimate_scan_duration_seconds(config: Config) -> float:
+def estimate_scan_duration_seconds(
+    config: Config, min_address: int | None = None, max_address: int | None = None
+) -> float:
     """Worst-case wall-clock seconds for one `scan_all_buses()` call.
 
-    Every address a scan probes is probed at most twice (once as its own
-    wake-up, once after the settle wait — see `SensorManager._scan_one_bus`),
-    and an absent address costs a full `scan_probe_timeout_seconds` each
-    time. Buses are scanned concurrently, so the estimate does not scale
-    with converter count. Used for the `/api/scan` route timeout and for the
-    warning logged before a long scan.
+    Addresses are scanned one at a time (see `SensorManager._scan_one_bus`):
+    an absent address costs a wake-up probe timeout, its own
+    `WAKEUP_SETTLE_SECONDS` wait, then a second probe timeout. Buses are
+    scanned concurrently, so the estimate does not scale with converter
+    count. Used for the `/api/scan` request timeout and for the warning
+    logged before a long scan.
+
+    `min_address`/`max_address` override `config.scan_min_address`/
+    `config.scan_max_address`, matching `SensorManager.scan_all_buses`.
     """
-    address_count = max(config.scan_max_address - config.scan_min_address + 1, 0)
-    return 2 * address_count * config.scan_probe_timeout_seconds + WAKEUP_SETTLE_SECONDS
+    low = config.scan_min_address if min_address is None else min_address
+    high = config.scan_max_address if max_address is None else max_address
+    address_count = max(high - low + 1, 0)
+    return address_count * (2 * config.scan_probe_timeout_seconds + WAKEUP_SETTLE_SECONDS)
 
 
 def _log_orphaned_scan_failure(task: "asyncio.Task[list[ScanResult]]") -> None:
@@ -98,6 +105,7 @@ class SensorManager:
         self._mapping: dict[str, list[int]] = {}
         self._mapping_established = False
         self._scan_task: asyncio.Task[list[ScanResult]] | None = None
+        self._scan_range: tuple[int, int] | None = None
 
     @property
     def is_scanning(self) -> bool:
@@ -146,28 +154,53 @@ class SensorManager:
         for bus in self._buses.values():
             await bus.aclose()
 
-    async def scan_all_buses(self) -> list[ScanResult]:
+    async def scan_all_buses(
+        self, min_address: int | None = None, max_address: int | None = None
+    ) -> list[ScanResult]:
         """Probe every configured converter's Modbus address space for
         present sensors, rebuilding the internal sensor table from the
         result.
 
-        Mutual exclusion: if a scan is already in progress, this call
-        waits on and returns that scan's result rather than starting a
-        second concurrent scan (ARCHITECTURE.md §4).
+        Mutual exclusion: if a scan of the same address range is already in
+        progress, this call waits on and returns that scan's result rather
+        than starting a second concurrent scan (ARCHITECTURE.md §4).
+
+        Args:
+            min_address, max_address: inclusive address range to probe;
+                each defaults to `config.scan_min_address`/
+                `config.scan_max_address`. Not persisted here — callers
+                save them to `config.json` if wanted.
 
         Returns:
             One `ScanResult` per configured converter.
 
         Raises:
-            BusScanError: a converter's serial connection is unusable.
+            BusScanError: a converter's serial connection is unusable, the
+                range is empty/out of bounds, or a scan of a different range
+                is already in progress.
         """
+        low = self._config.scan_min_address if min_address is None else min_address
+        high = self._config.scan_max_address if max_address is None else max_address
+        if not MODBUS_MIN_UNIT_ADDRESS <= low <= high <= MODBUS_MAX_UNIT_ADDRESS:
+            raise BusScanError(
+                f"invalid scan range {low}-{high}; need "
+                f"{MODBUS_MIN_UNIT_ADDRESS} <= min <= max <= {MODBUS_MAX_UNIT_ADDRESS}"
+            )
+
         task = self._scan_task
         # No await between the check and create_task, so two callers landing in
         # the same event-loop iteration cannot both start a scan.
         if task is None or task.done():
-            task = asyncio.create_task(self._scan_all_buses(), name="modbus-scan")
+            task = asyncio.create_task(self._scan_all_buses(low, high), name="modbus-scan")
             task.add_done_callback(_log_orphaned_scan_failure)
             self._scan_task = task
+            self._scan_range = (low, high)
+        elif self._scan_range != (low, high):
+            assert self._scan_range is not None
+            raise BusScanError(
+                f"a scan of addresses {self._scan_range[0]}-{self._scan_range[1]} is "
+                f"already in progress; retry the {low}-{high} scan once it completes"
+            )
         else:
             logger.info("Bus scan already in progress; awaiting its result")
         # Shielded so an API client giving up (504) doesn't cancel a scan other
@@ -335,28 +368,30 @@ class SensorManager:
             status_text=status_text,
         )
 
-    async def _scan_all_buses(self) -> list[ScanResult]:
+    async def _scan_all_buses(self, min_address: int, max_address: int) -> list[ScanResult]:
         """The actual scan, run as `self._scan_task` so concurrent callers
         share one in-progress scan."""
-        addresses = range(self._config.scan_min_address, self._config.scan_max_address + 1)
-        estimate = estimate_scan_duration_seconds(self._config)
+        addresses = range(min_address, max_address + 1)
+        estimate = estimate_scan_duration_seconds(self._config, min_address, max_address)
         logger.info(
             "Scanning %d converter(s) for Modbus addresses %d-%d (%d addresses each, "
             "%.2fs probe timeout, worst case ~%.0fs)",
             len(self._buses),
-            self._config.scan_min_address,
-            self._config.scan_max_address,
+            min_address,
+            max_address,
             len(addresses),
             self._config.scan_probe_timeout_seconds,
             estimate,
         )
         if estimate > 60.0:
             logger.warning(
-                "This scan can take up to ~%.0fs: every absent address costs a full "
-                "%.2fs probe timeout, twice. Narrow scan_min_address/scan_max_address to "
-                "the addresses actually installed, or lower scan_probe_timeout_seconds.",
+                "This scan can take up to ~%.0fs: every absent address costs two full "
+                "%.2fs probe timeouts plus a %.2fs wake-up settle. Narrow "
+                "scan_min_address/scan_max_address to the addresses actually installed, "
+                "or lower scan_probe_timeout_seconds.",
                 estimate,
                 self._config.scan_probe_timeout_seconds,
+                WAKEUP_SETTLE_SECONDS,
             )
 
         results = await asyncio.gather(
@@ -373,45 +408,42 @@ class SensorManager:
         return list(results)
 
     async def _scan_one_bus(self, bus: ModbusBus, addresses: Iterable[int]) -> ScanResult:
-        """Probe one converter's address space in two passes.
+        """Probe one converter's address space one address at a time.
 
         The vendor doc says an idle instrument answers only after a wake-up
         command, so the first probe of an address doubles as that wake-up and
-        a non-answer is inconclusive. Rather than pay `WAKEUP_SETTLE_SECONDS`
-        per address, the non-answering addresses are re-probed once after a
-        single settle wait.
+        a non-answer is inconclusive: it is re-probed once after its own
+        settle wait before moving on. Each address is finished before the
+        next is touched — a bulk wake-up pass followed by a re-probe pass
+        overloaded the instruments with back-to-back probes, and on a wide
+        range the early-woken addresses had dozed off again before the second
+        pass reached them.
         """
         probe_timeout = self._config.scan_probe_timeout_seconds
         logger.info("Scanning %s", bus.converter_id)
         found: list[int] = []
-        unanswered: list[int] = []
 
         for address in addresses:
             if await bus.probe_address(address, probe_timeout):
                 found.append(address)
                 logger.info("Found sensor at address %d on %s", address, bus.converter_id)
-            else:
-                unanswered.append(address)
-
-        if unanswered:
+                continue
             logger.debug(
-                "%s: %d address(es) did not answer the first (wake-up) probe; re-probing "
+                "%s: address %d did not answer the first (wake-up) probe; re-probing "
                 "after %.2fs settle",
                 bus.converter_id,
-                len(unanswered),
+                address,
                 bus.wakeup_settle_seconds,
             )
             await asyncio.sleep(bus.wakeup_settle_seconds)
-            for address in unanswered:
-                if await bus.probe_address(address, probe_timeout):
-                    found.append(address)
-                    logger.info(
-                        "Found sensor at address %d on %s (answered after wake-up)",
-                        address,
-                        bus.converter_id,
-                    )
+            if await bus.probe_address(address, probe_timeout):
+                found.append(address)
+                logger.info(
+                    "Found sensor at address %d on %s (answered after wake-up)",
+                    address,
+                    bus.converter_id,
+                )
 
-        found.sort()
         logger.info(
             "Done scanning %s: %s",
             bus.converter_id,

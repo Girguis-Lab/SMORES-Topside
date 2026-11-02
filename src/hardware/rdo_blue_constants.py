@@ -37,14 +37,14 @@ MULTI_REGISTER_WORD_ORDER_BIG_ENDIAN: Final[bool] = True
 PARAMETER_VALUE_OFFSET: Final[int] = 0
 """float32, 2 registers. The measured value."""
 
-PARAMETER_DATA_QUALITY_OFFSET: Final[int] = 2
-"""uint16, 1 register. See DATA_QUALITY_TEXT below."""
+PARAMETER_ID_OFFSET: Final[int] = 2
+"""uint16, 1 register. See PARAMETER_NAMES below."""
 
 PARAMETER_UNITS_ID_OFFSET: Final[int] = 3
 """uint16, 1 register, R/W. See UNITS_TEXT below. Not written by this system."""
 
-PARAMETER_ID_OFFSET: Final[int] = 4
-"""uint16, 1 register. See PARAMETER_NAMES below."""
+PARAMETER_DATA_QUALITY_OFFSET: Final[int] = 4
+"""uint16, 1 register. See DATA_QUALITY_TEXT below."""
 
 PARAMETER_SENTINEL_OFFSET: Final[int] = 5
 """float32, 2 registers, R/W. Value substituted by the instrument on error."""
@@ -71,11 +71,13 @@ PARAMETER_NAMES: Final[dict[int, str]] = {
 DATA_QUALITY_OK: Final[int] = 0
 DATA_QUALITY_ERROR_READING_PARAMETER: Final[int] = 3
 DATA_QUALITY_RDO_CAP_EXPIRED: Final[int] = 5
+DATA_QUALITY_SENSOR_MISSING: Final[int] = 7
 
 DATA_QUALITY_TEXT: Final[dict[int, str]] = {
     DATA_QUALITY_OK: "No errors or warnings",
     DATA_QUALITY_ERROR_READING_PARAMETER: "Error reading parameter",
     DATA_QUALITY_RDO_CAP_EXPIRED: "RDO Cap expired",
+    DATA_QUALITY_SENSOR_MISSING: "Sensor Missing"
 }
 """Known Data Quality IDs only; the doc notes other codes exist ("contact
 technical support") without enumerating them. Callers should fall back to
@@ -107,9 +109,9 @@ This system never *writes* the Units ID."""
 
 # --- Read shapes used by hardware.rdo_blue ---
 
-PARAMETER_READ_REGISTER_COUNT: Final[int] = PARAMETER_UNITS_ID_OFFSET + 1
-"""Registers fetched by one parameter read: the float32 value (offsets 0-1),
-the Data Quality ID (offset 2), and the Units ID (offset 3) in a single
+PARAMETER_READ_REGISTER_COUNT: Final[int] = PARAMETER_DATA_QUALITY_OFFSET + 1
+"""Registers fetched by one parameter read: the float32 value,
+the Data Quality ID, and the Units ID in a single
 request. The remaining block registers (Parameter ID, sentinel) aren't used
 by this system, so they aren't fetched."""
 

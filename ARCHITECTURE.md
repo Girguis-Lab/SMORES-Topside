@@ -44,7 +44,10 @@ src/                             Python package (root), imported as top-level mo
                                   read_partial_pressure_torr, read_status,
                                   read_serial_num, read_device_id, read_all()
     rdo_blue.py                  BlueRDOSensor(BlueRDOInterface): real implementation,
-                                  takes a ModbusBus + integer address
+                                  takes a ModbusBus + integer address. Decodes
+                                  multi-register values (float32 parameters, uint32
+                                  serial number) with pymodbus's
+                                  ModbusClientMixin.convert_from_registers (§2)
     modbus_bus.py                ModbusBus: one instance per RS485-to-USB converter.
                                   Wraps pymodbus AsyncModbusSerialClient (retries=0);
                                   serializes all requests on the port behind an
@@ -138,7 +141,7 @@ Rationale for a few naming choices:
 
 | Library                | Used in                                      | Purpose                                                             |
 | ----------------------- | --------------------------------------------- | -------------------------------------------------------------------- |
-| pymodbus (>=3.6)        | `hardware/modbus_bus.py`                      | `AsyncModbusSerialClient` — async Modbus RTU client over serial     |
+| pymodbus (>=3.6)        | `hardware/modbus_bus.py`, `hardware/rdo_blue.py` | `AsyncModbusSerialClient` — async Modbus RTU client over serial; `ModbusClientMixin.convert_from_registers` decodes register words to float32/uint32 in `rdo_blue.py` (the successor to `pymodbus.payload.BinaryPayloadDecoder.fromRegisters`, which pymodbus removed in 3.9), with word order taken from `rdo_blue_constants.MULTI_REGISTER_WORD_ORDER_BIG_ENDIAN` |
 | pyserial-asyncio        | `hardware/modbus_bus.py` (transitively, via pymodbus's asyncio serial transport) | Async serial I/O backing pymodbus |
 | aiosqlite               | `db/database.py`                              | Non-blocking SQLite access from the event loop                      |
 | psutil                  | `db/retention.py`                             | `psutil.disk_usage()` for free-space checks                         |
@@ -187,7 +190,7 @@ back up with the new config).
 | `sensor_read_timeout_seconds`     | `float`                 | `3.0`                | Timeout for one sensor's full multi-register read (`read_all()`) — "sensor timeout" |
 | `scan_probe_timeout_seconds`      | `float`                 | `1.0`                | Timeout probing the modbuss address space of one RS485-to-usb serial converter.                    |
 | `scan_min_address`                | `int`                   | `1`                  | Lowest Modbus address a scan probes (inclusive)                        |
-| `scan_max_address`                | `int`                   | `247`                | Highest Modbus address a scan probes (inclusive). Defaults to the whole legal RTU space; every *absent* address in the range costs a full `scan_probe_timeout_seconds`, twice (§4), so narrowing this to the highest address actually installed is the main lever on scan time |
+| `scan_max_address`                | `int`                   | `247`                | Highest Modbus address a scan probes (inclusive). Defaults to the whole legal RTU space; every *absent* address in the range costs two full `scan_probe_timeout_seconds` plus a wake-up settle (§4), so narrowing this to the highest address actually installed is the main lever on scan time |
 | `api_host`                        | `str`                   | `"0.0.0.0"`          | aiohttp bind address                                                   |
 | `api_port`                        | `int`                   | `8080`               | aiohttp bind port                                                      |
 | `api_request_timeout_seconds`     | `float`                 | `10.0`               | Default per-request timeout for most endpoints (504 on expiry)         |
@@ -279,10 +282,14 @@ Example `config.json`:
   timeout) and is reported unreachable by `read_all()`'s own timeout rather
   than by four consecutive per-request ones.
 - **Scan mutual exclusion:** `hardware/manager.py` keeps the in-progress
-  `asyncio.Task` for `scan_all_buses()`. A scan request arriving while one
-  is already running does not start a second concurrent scan; `AGENTS.md`
-  allows either erroring or waiting on the in-progress result — this
-  project awaits the existing task (shielded, so an API client that gives
+  `asyncio.Task` for `scan_all_buses()`, plus the address range it is
+  probing. A scan request arriving while one is already running does not
+  start a second concurrent scan; `AGENTS.md` allows either erroring or
+  waiting on the in-progress result — a request for the *same* range
+  awaits the existing task, while one for a *different* range (via
+  `/api/scan`'s `start_address`/`stop_address`) gets `BusScanError`
+  (→ HTTP 503), since the in-progress result wouldn't answer it. Awaiting
+  the existing task is done (shielded, so an API client that gives
   up doesn't cancel a scan the startup path may still be waiting on) and
   returns its result to avoid needlessly failing a second caller. While a
   scan is running and no mapping is established yet,
@@ -291,18 +298,22 @@ Example `config.json`:
   informative error". An *established* mapping that happens to be empty is
   not an error — a system where no sensors were found simply has no
   readings.
-- **Scan cost (two passes):** an absent Modbus address can only be ruled
-  out by letting its probe time out, and because the first probe of an idle
-  instrument doubles as its wake-up, a non-answer on the first pass is
-  inconclusive. `_scan_one_bus` therefore probes the whole range once, then
-  re-probes only the addresses that didn't answer, after a single
-  `WAKEUP_SETTLE_SECONDS` wait — so a *present* sensor is probed once or
-  twice and an absent address costs two probe timeouts. Buses are scanned
+- **Scan cost (sequential, per address):** an absent Modbus address can only
+  be ruled out by letting its probe time out, and because the first probe of
+  an idle instrument doubles as its wake-up, a non-answer on the first probe
+  is inconclusive. `_scan_one_bus` therefore finishes each address before
+  moving to the next: probe, and if unanswered, wait `WAKEUP_SETTLE_SECONDS`
+  and re-probe once. (An earlier bulk wake-up pass followed by a re-probe
+  pass overloaded the instruments with back-to-back probes, and on a wide
+  range the early addresses had gone back to sleep before the second pass
+  reached them.) A *present* sensor is probed once or twice; an absent
+  address costs two probe timeouts plus one settle. Buses are scanned
   concurrently (separate ports), so the worst case is
-  `2 x address_count x scan_probe_timeout_seconds + WAKEUP_SETTLE_SECONDS`
+  `address_count x (2 x scan_probe_timeout_seconds + WAKEUP_SETTLE_SECONDS)`
   regardless of converter count; `hardware.manager.estimate_scan_duration_seconds`
   computes it, and it is both logged before a scan (with a warning above
-  60 s) and used as the `/api/scan` route timeout.
+  60 s) and used as each `/api/scan` request's timeout, computed for the
+  range that request will scan.
 - **API concurrency cap:** `api/middleware.py`'s
   `concurrency_limit_middleware` uses an `asyncio.Semaphore(config.api_max_concurrent_clients)`.
   Acquisition is non-blocking: the middleware checks the semaphore's free
@@ -436,14 +447,27 @@ at `GET /api/docs`.
 | `/api/data`                | DELETE | `delete_data`             | `api_request_timeout_seconds`        |
 | `/api/config`              | GET    | `get_config`              | `api_request_timeout_seconds`        |
 | `/api/config`              | PUT    | `put_config`              | `api_request_timeout_seconds`        |
-| `/api/scan`                | GET    | `scan_buses`              | `hardware.manager.estimate_scan_duration_seconds(config)` — the scan's worst case (§4); the earlier `scan_probe_timeout_seconds * num converters` budget could never cover a real scan |
+| `/api/scan`                | GET    | `scan_buses`              | `hardware.manager.estimate_scan_duration_seconds` for the requested range — the scan's worst case (§4), computed per request (`with_timeout` also accepts a `Callable[[web.Request], float]`) |
+
+Query parameters:
+
+| Route | Param | Type / default | Effect |
+| --- | --- | --- | --- |
+| `GET /api/sensors/current` | `save` | bool, `false` | If true, also inserts the readings (one row per sensor) via `sampler.sample_once` — the same path the periodic sampler uses — and returns them with their `row_id`s |
+| `GET /api/scan` | `start_address` | int 1–247, saved `scan_min_address` | Lowest address probed; saved as `scan_min_address` after a successful scan |
+| `GET /api/scan` | `stop_address` | int 1–247, saved `scan_max_address` | Highest address probed; saved as `scan_max_address` after a successful scan |
+
+An invalid value, or `start_address > stop_address` once defaults are
+filled in, is a 400 with nothing scanned or saved.
 
 `get_current_readings` calls `hardware.manager.query_all_sensors()`
-directly (no DB write). `scan_buses` calls
-`hardware.manager.scan_all_buses()` then `config.loader.save_config()`
-to overwrite `sensor_mapping` (no process restart — unlike `PUT /api/config`,
-this only ever changes one field the manager already applied to its own
-in-memory state during the scan it just ran).
+directly (no DB write), or `sampler.sample_once()` when `save=true`.
+`scan_buses` calls `hardware.manager.scan_all_buses(min, max)` then
+`config.loader.save_config()` to overwrite `sensor_mapping` and
+`scan_min_address`/`scan_max_address` (no process restart — unlike
+`PUT /api/config`, these are only fields the manager already applied to its
+own in-memory state during the scan it just ran, or that only affect future
+scans).
 
 ## 8. Lifecycle (`main.py`)
 

@@ -1,0 +1,42 @@
+Parsed 0 registers definitions from 1 files
+Serial port /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A946T3BG-if00-port0. Parameters: 19200 baud, 1 stop bit(s), parity: E, timeout 0.1s.
+→ < 01 03 00 03 00 01 74 0a >
+← < 01 03 02 00 00 b8 44 > 7 bytes
+← [0]
+3: 0 0x0
+Parsed 0 registers definitions from 1 files
+Serial port /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A946T3BG-if00-port0. Parameters: 19200 baud, 1 stop bit(s), parity: E, timeout 0.1s.
+→ < 01 03 00 10 00 01 85 cf >
+← < 01 03 02 07 d0 bb e8 > 7 bytes
+← [2000]
+16: 2000 0x7d0
+Parsed 0 registers definitions from 1 files
+Serial port /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A946T3BG-if00-port0. Parameters: 19200 baud, 1 stop bit(s), parity: E, timeout 0.1s.
+→ < 01 03 00 13 00 01 75 cf >
+← < 01 03 02 00 01 79 84 > 7 bytes
+← [1]
+19: 1 0x1
+Parsed 0 registers definitions from 1 files
+Serial port /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A946T3BG-if00-port0. Parameters: 19200 baud, 1 stop bit(s), parity: E, timeout 0.1s.
+→ < 01 03 00 14 00 01 c4 0e >
+← < 01 03 02 00 00 b8 44 > 7 bytes
+← [0]
+20: 0 0x0
+Parsed 0 registers definitions from 1 files
+Serial port /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A946T3BG-if00-port0. Parameters: 19200 baud, 1 stop bit(s), parity: E, timeout 0.1s.
+→ < 01 03 00 27 00 01 34 01 >
+← < 01 03 02 00 14 b8 4b > 7 bytes
+← [20]
+39: 20 0x14
+Parsed 0 registers definitions from 1 files
+Serial port /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A946T3BG-if00-port0. Parameters: 19200 baud, 1 stop bit(s), parity: E, timeout 0.1s.
+→ < 01 03 00 48 00 01 04 1c >
+← < 01 03 02 00 a3 f8 3d > 7 bytes
+← [163]
+72: 163 0xa3
+Parsed 0 registers definitions from 1 files
+Serial port /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A946T3BG-if00-port0. Parameters: 19200 baud, 1 stop bit(s), parity: E, timeout 0.1s.
+→ < 01 03 00 fb 00 01 f5 fb >
+← < 01 03 02 00 00 b8 44 > 7 bytes
+← [0]
+251: 0 0x0

@@ -206,8 +206,67 @@ async def test_scan_probes_every_address_in_the_configured_range(
 
     await manager.scan_all_buses()
 
-    first_pass = buses[CONVERTER_A].probes[: SCAN_MAX_ADDRESS - SCAN_MIN_ADDRESS + 1]
-    assert first_pass == list(range(SCAN_MIN_ADDRESS, SCAN_MAX_ADDRESS + 1))
+    probed_in_order = list(dict.fromkeys(buses[CONVERTER_A].probes))
+    assert probed_in_order == list(range(SCAN_MIN_ADDRESS, SCAN_MAX_ADDRESS + 1))
+
+
+async def test_scan_probes_only_an_explicitly_requested_range(
+    manager: SensorManager, buses: dict[str, FakeBus], config: Config
+) -> None:
+    buses[CONVERTER_A].present = {2, 3, 7}
+    await manager.start()
+
+    results = await manager.scan_all_buses(min_address=2, max_address=7)
+
+    probed_in_order = list(dict.fromkeys(buses[CONVERTER_A].probes))
+    assert probed_in_order == list(range(2, 8))
+    found = {result.converter_id: result.sensor_addresses for result in results}
+    assert found[CONVERTER_A] == [2, 3, 7]
+    # The manager doesn't persist the range itself; the caller does.
+    assert (config.scan_min_address, config.scan_max_address) == (
+        SCAN_MIN_ADDRESS,
+        SCAN_MAX_ADDRESS,
+    )
+
+
+async def test_scan_with_one_bound_defaults_the_other_from_config(
+    manager: SensorManager, buses: dict[str, FakeBus]
+) -> None:
+    await manager.start()
+
+    await manager.scan_all_buses(min_address=3)
+
+    assert list(dict.fromkeys(buses[CONVERTER_A].probes)) == list(range(3, SCAN_MAX_ADDRESS + 1))
+
+
+@pytest.mark.parametrize(
+    ("min_address", "max_address"),
+    [(3, 2), (0, 2), (1, MODBUS_MAX_UNIT_ADDRESS + 1)],
+)
+async def test_scan_rejects_an_invalid_range(
+    manager: SensorManager, buses: dict[str, FakeBus], min_address: int, max_address: int
+) -> None:
+    await manager.start()
+
+    with pytest.raises(BusScanError):
+        await manager.scan_all_buses(min_address, max_address)
+
+    assert buses[CONVERTER_A].probes == []
+
+
+async def test_a_concurrent_scan_of_a_different_range_errors(
+    manager: SensorManager, buses: dict[str, FakeBus]
+) -> None:
+    for bus in buses.values():
+        bus.probe_delay_seconds = 0.01
+    await manager.start()
+    task = asyncio.create_task(manager.scan_all_buses())
+    await asyncio.sleep(0)
+
+    with pytest.raises(BusScanError, match="already in progress"):
+        await manager.scan_all_buses(min_address=2, max_address=3)
+
+    await task
 
 
 async def test_scan_finds_a_sensor_that_ignores_its_first_wake_up_probe(
@@ -287,9 +346,9 @@ async def test_a_concurrent_scan_waits_on_the_one_in_progress(
     assert [result.sensor_addresses for result in first] == [
         result.sensor_addresses for result in second
     ]
-    # Exactly one scan's worth of probes: the whole range once, then the
-    # addresses that didn't answer re-probed once after the settle wait.
-    assert buses[CONVERTER_A].probes == [1, 2, 3, 4, 2, 3, 4]
+    # Exactly one scan's worth of probes, address by address: each one that
+    # didn't answer is re-probed (after its settle wait) before moving on.
+    assert buses[CONVERTER_A].probes == [1, 2, 2, 3, 3, 4, 4]
 
 
 async def test_is_scanning_is_true_only_during_a_scan(
@@ -341,11 +400,22 @@ async def test_aclose_cancels_an_in_progress_scan(
         await task
 
 
-async def test_estimate_scan_duration_covers_two_probes_per_address(config: Config) -> None:
+async def test_estimate_scan_duration_covers_two_probes_and_a_settle_per_address(
+    config: Config,
+) -> None:
     address_count = SCAN_MAX_ADDRESS - SCAN_MIN_ADDRESS + 1
-    expected = 2 * address_count * config.scan_probe_timeout_seconds + WAKEUP_SETTLE_SECONDS
+    expected = address_count * (2 * config.scan_probe_timeout_seconds + WAKEUP_SETTLE_SECONDS)
 
     assert estimate_scan_duration_seconds(config) == pytest.approx(expected)
+
+
+async def test_estimate_scan_duration_honors_an_explicit_range(config: Config) -> None:
+    per_address = 2 * config.scan_probe_timeout_seconds + WAKEUP_SETTLE_SECONDS
+
+    assert estimate_scan_duration_seconds(config, 10, 19) == pytest.approx(10 * per_address)
+    assert estimate_scan_duration_seconds(config, max_address=2) == pytest.approx(
+        (2 - SCAN_MIN_ADDRESS + 1) * per_address
+    )
 
 
 # --- save_sensor_mapping --------------------------------------------------

@@ -16,7 +16,10 @@
 #      liveness detection (LCP echo) and unattended redial (`persist`).
 #
 #   2. IPv4 forwarding plus an nftables masquerade rule, so the buoy's packets
-#      leave this Pi wearing this Pi's campus IP address.
+#      leave this Pi wearing this Pi's campus IP address. Both are applied as
+#      plain `sysctl -w` / `nft add` commands by a oneshot unit at every boot —
+#      nothing in /etc/sysctl.d or /etc/nftables*, so the unit file is the one
+#      place that defines them, and removing it removes them.
 #
 # Why NAT rather than a true bridge: "as if connected directly" would mean the
 # buoy holding its own address on the campus subnet. That needs the university
@@ -117,8 +120,8 @@ TS_DROPIN="/etc/systemd/system/tailscaled.service.d/smores-radio-mtu.conf"
 
 NFT_FILE="/etc/nftables.d/smores-radio-nat.nft"
 SYSCTL_FILE="/etc/sysctl.d/99-smores-radio-forward.conf"
-LINK_UNIT="smores-radio-link.service"
-NAT_UNIT="smores-radio-nat.service"
+SMORES_LINK_SERVICE="smores-radio-link.service"
+SMORES_NAT_SERVICE="smores-radio-nat.service"
 
 ACTION="apply"
 PROG="${0##*/}"
@@ -266,45 +269,18 @@ require_tools() {
 
 # ------------------------------------------------------------ file writing --
 
-write_nat_files() {
-    install -d -m 0755 /etc/sysctl.d
-    printf '# Managed by deploy/setup_radio_link_shore.sh\nnet.ipv4.ip_forward=1\n' >"$SYSCTL_FILE"
-    note "Wrote $SYSCTL_FILE"
-
-    install -d -m 0755 /etc/nftables.d
-    cat >"$NFT_FILE" <<'EOF'
-#!/usr/sbin/nft -f
-# Managed by deploy/setup_radio_link_shore.sh
-#
-# Its own table, loaded with the add/delete/add idiom, so applying this replaces
-# only these rules and never disturbs a ruleset some other tool installed.
-
-table ip smores_nat
-delete table ip smores_nat
-
-table ip smores_nat {
-    chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-
-        # Anything arriving over a PPP link and leaving by any other interface
-        # goes out as this Pi. Matching on the interface rather than on the
-        # buoy's address means it keeps working if the link addressing changes,
-        # if the uplink moves from eth0 to wlan0, or if a LAN is ever hung off
-        # the buoy.
-        iifname "ppp*" oifname != "ppp*" masquerade
-    }
-}
-EOF
-    note "Wrote $NFT_FILE"
-}
-
 write_units() {
-    cat >"/etc/systemd/system/$NAT_UNIT" <<EOF
+    cat >"/etc/systemd/system/$SMORES_NAT_SERVICE" <<EOF
 [Unit]
 Description=SMORES radio link NAT (masquerade buoy traffic onto the campus network)
 Documentation=file:///home/pi/SMORES-Topside/deploy/setup_radio_link_shore.sh
 After=network.target
-Before=$LINK_UNIT
+Before=$SMORES_RADIO_LINK_SERVICE
+# nftables.service, if enabled, runs 'flush ruleset' on start/restart, which
+# would silently wipe the table below while this unit still reports active.
+# PartOf re-runs this unit whenever that happens; harmless if it is not enabled.
+After=nftables.service
+PartOf=nftables.service
 
 [Service]
 # oneshot + RemainAfterExit: the rules outlive the process that installed them,
@@ -313,22 +289,39 @@ Before=$LINK_UNIT
 # for connections riding the link would be lost with it.
 Type=oneshot
 RemainAfterExit=yes
+
+# Runtime only; nothing in /etc/sysctl.d. Reverts to 0 on reboot unless this
+# unit runs again.
 ExecStart=/usr/sbin/sysctl -q -w net.ipv4.ip_forward=1
-ExecStart=/usr/sbin/nft -f $NFT_FILE
+
+# Create our own nft table rather than the shared 'ip nat' one, which iptables-nft, Docker
+# and Tailscale also write into — so stop can drop exactly our rules and
+# nothing else. 'nft add rule' appends, so start from an empty table every
+# time; otherwise each restart would stack another copy of the rule.
+ExecStartPre=-/usr/sbin/nft delete table ip smores_nat
+ExecStart=/usr/sbin/nft add table ip smores_nat
+ExecStart=/usr/sbin/nft add chain ip smores_nat postrouting '{ type nat hook postrouting priority srcnat; policy accept; }'
+# Anything arriving over a PPP link and leaving by any other interface goes out
+# as this Pi. iifname, not oifname: it is the buoy's traffic *from* the radio
+# that needs this Pi's campus address. Matching on interface rather than the
+# buoy's IP keeps working if the link addressing changes, if the uplink moves
+# from eth0 to wlan0, or if a LAN is ever hung off the buoy.
+ExecStart=/usr/sbin/nft add rule ip smores_nat postrouting iifname "ppp*" oifname != "ppp*" masquerade
+
 ExecStop=-/usr/sbin/nft delete table ip smores_nat
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    note "Wrote /etc/systemd/system/$NAT_UNIT"
+    note "Wrote /etc/systemd/system/$SMORES_NAT_SERVICE"
 
-    cat >"/etc/systemd/system/$LINK_UNIT" <<EOF
+    cat >"/etc/systemd/system/$SMORES_RADIO_LINK_SERVICE" <<EOF
 [Unit]
 Description=SMORES radio link (PPP over RFD900x) — shore side
 Documentation=man:pppd(8)
 Documentation=file:///home/pi/SMORES-Topside/deploy/setup_radio_link_shore.sh
-Wants=$NAT_UNIT
-After=$NAT_UNIT
+Wants=$SMORES_NAT_SERVICE
+After=$SMORES_NAT_SERVICE
 
 # No start rate limit. This is an unattended field link: if the radio is
 # unplugged for ten minutes, systemd must still be retrying when it comes back,
@@ -345,7 +338,7 @@ ExecStartPre=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do [ -e "$RADIO_DEV" ] &
 
 # Extra pppd options, empty by default. To trace LCP/IPCP negotiation without
 # touching this file (which the setup script regenerates):
-#   sudo systemctl edit $LINK_UNIT      ->  [Service]
+#   sudo systemctl edit $SMORES_RADIO_LINK_SERVICE      ->  [Service]
 #                                           Environment=PPPD_EXTRA=debug
 Environment=PPPD_EXTRA=
 
@@ -387,7 +380,7 @@ ExecStart=/usr/sbin/pppd $RADIO_DEV $RADIO_BAUD \\
     persist maxfail 0 holdoff $HOLDOFF \\
 # nodetach keeps pppd in the foreground so systemd supervises it directly.
 # nolog stops it writing every line to both stderr and syslog; journald keeps
-# the syslog copy, so 'journalctl -u $LINK_UNIT' shows everything once.
+# the syslog copy, so 'journalctl -u $SMORES_RADIO_LINK_SERVICE' shows everything once.
     nodetach nolog \$PPPD_EXTRA
 
 # persist/maxfail above already ride out RF outages and peer reboots without
@@ -408,7 +401,7 @@ SyslogIdentifier=smores-radio-link
 [Install]
 WantedBy=multi-user.target
 EOF
-    note "Wrote /etc/systemd/system/$LINK_UNIT"
+    note "Wrote /etc/systemd/system/$SMORES_RADIO_LINK_SERVICE"
 }
 
 # ------------------------------------------------------------------ apply --
@@ -416,15 +409,15 @@ EOF
 do_apply() {
     validate_args
     require_tools
-
-    write_nat_files
     write_units
 
-    sysctl -q -w net.ipv4.ip_forward=1
     systemctl daemon-reload
-    systemctl enable --now "$NAT_UNIT" >/dev/null
-    systemctl enable --now "$LINK_UNIT" >/dev/null
-    ok "Enabled $NAT_UNIT and $LINK_UNIT (both start at boot)."
+    # restart, not just start: on a re-run the unit is already active, and a
+    # oneshot only re-applies its rules when it is actually run again.
+    systemctl enable "$SMORES_NAT_SERVICE" >/dev/null
+    systemctl restart "$SMORES_NAT_SERVICE"
+    systemctl enable --now "$SMORES_RADIO_LINK_SERVICE" >/dev/null
+    ok "Enabled $SMORES_NAT_SERVICE and $SMORES_RADIO_LINK_SERVICE (both start at boot)."
 
     printf '\n'
     if [ "$FLOW_CONTROL" = "crtscts" ]; then
@@ -450,8 +443,8 @@ do_apply() {
 do_status() {
     local rc=0
     note "Units:"
-    systemctl is-enabled "$NAT_UNIT" "$LINK_UNIT" 2>&1 | sed 's/^/  enabled: /' || true
-    systemctl is-active "$NAT_UNIT" "$LINK_UNIT" 2>&1 | sed 's/^/  active:  /' || true
+    systemctl is-enabled "$SMORES_NAT_SERVICE" "$SMORES_RADIO_LINK_SERVICE" 2>&1 | sed 's/^/  enabled: /' || true
+    systemctl is-active "$SMORES_NAT_SERVICE" "$SMORES_RADIO_LINK_SERVICE" 2>&1 | sed 's/^/  active:  /' || true
 
     note "PPP interfaces:"
     if [ -n "$(ppp_addrs)" ]; then
@@ -490,7 +483,7 @@ do_status() {
     if [ "$rc" -eq 0 ]; then
         ok "Shore side is up."
     else
-        warn "See: journalctl -u $LINK_UNIT -n 50"
+        warn "See: journalctl -u $SMORES_RADIO_LINK_SERVICE -n 50"
     fi
     return "$rc"
 }
@@ -498,10 +491,9 @@ do_status() {
 # ----------------------------------------------------------------- remove --
 
 do_remove() {
-    systemctl disable --now "$LINK_UNIT" >/dev/null 2>&1 || true
-    systemctl disable --now "$NAT_UNIT" >/dev/null 2>&1 || true
-    rm -f "/etc/systemd/system/$LINK_UNIT" "/etc/systemd/system/$NAT_UNIT"
-    rm -f "$NFT_FILE" "$SYSCTL_FILE"
+    systemctl disable --now "$SMORES_RADIO_LINK_SERVICE" >/dev/null 2>&1 || true
+    systemctl disable --now "$SMORES_NAT_SERVICE" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$SMORES_RADIO_LINK_SERVICE" "/etc/systemd/system/$SMORES_NAT_SERVICE"
     nft delete table ip smores_nat 2>/dev/null || true
     systemctl daemon-reload
     restore_tailscale_mtu

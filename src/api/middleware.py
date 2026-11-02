@@ -18,12 +18,18 @@ read back by the timeout middleware to find a per-route override."""
 
 _RETRY_AFTER_SECONDS: Final[int] = 1
 
+type RouteTimeout = float | Callable[[web.Request], float]
+"""A fixed timeout in seconds, or a function computing one per request
+(e.g. `/api/scan`, whose worst case depends on its address-range query
+params)."""
 
-def with_timeout(seconds: float) -> Callable[[Handler], Handler]:
+
+def with_timeout(seconds: RouteTimeout) -> Callable[[Handler], Handler]:
     """Decorator marking a route handler's timeout override (e.g.
     `/api/sensors/current`'s `config.poll_timeout_seconds`), read by
     `create_timeout_middleware`. Undecorated handlers use that
-    middleware's `default_timeout_seconds`.
+    middleware's `default_timeout_seconds`. `seconds` may also be a
+    callable taking the `web.Request`, evaluated before the handler runs.
 
     Since it only tags the handler object and returns it unchanged, it also
     works as a plain function call at route-registration time
@@ -52,7 +58,8 @@ def create_timeout_middleware(default_timeout_seconds: float) -> Middleware:
     @web.middleware
     async def timeout_middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
         route_handler = request.match_info.handler
-        timeout_seconds = getattr(route_handler, RouteTimeoutAttr, default_timeout_seconds)
+        timeout: RouteTimeout = getattr(route_handler, RouteTimeoutAttr, default_timeout_seconds)
+        timeout_seconds = timeout(request) if callable(timeout) else timeout
         try:
             return await asyncio.wait_for(handler(request), timeout=timeout_seconds)
         except TimeoutError:
