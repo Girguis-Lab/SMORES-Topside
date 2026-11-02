@@ -102,11 +102,11 @@ Ethernet cable
 |
 Raspberry Pi (AKA "Shore-Side Computer") - used as network bridge
 |
-250kbps Serial Radio Modem "A"
+224kbps Serial Radio Modem "A"
 |
 Radio Link
 |
-250kbps Serial Radio Modem "B"
+224kbps Serial Radio Modem "B"
 |
 Raspberry Pi (AKA "Remote Bouy Computer") - Runs a webserver and a tailscale reverse proxy/vpn for remote access to this webserver. Can have static or dynamic IP
 

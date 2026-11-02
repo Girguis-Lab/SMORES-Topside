@@ -35,7 +35,7 @@
 # `AT&W` to save, `ATZ` to reboot):
 #
 #   ATS1=57      SERIAL_SPEED in kbps. Must equal --baud below.
-#   ATS2=250     AIR_SPEED 250 kbps — the figure quoted for this link. Note that
+#   ATS2=224     AIR_SPEED 224 kbps — the figure quoted for this link. Note that
 #                is the *air* rate; real throughput is roughly half of it, and
 #                S1 (the wire to the Pi) is a separate, lower number by default.
 #   ATS3=<id>    NETID — same on both radios, different from anyone else nearby.
@@ -49,9 +49,10 @@
 #   sudo deploy/setup_radio_link_shore.sh --device /dev/serial/by-id/usb-FTDI_...
 #   sudo deploy/setup_radio_link_shore.sh --status
 #   sudo deploy/setup_radio_link_shore.sh --remove
+#   sudo deploy/setup_radio_link_shore.sh --remove-tailscale-mtu
 #
 # Every setting is also readable from the environment:
-#   RADIO_DEV=/dev/serial/by-id/... RADIO_BAUD=115200 \
+#   RADIO_DEV=/dev/serial/by-id/... RADIO_BAUD=115200 PPP_MTU=576 PPP_MRU=576 \
 #     sudo -E deploy/setup_radio_link_shore.sh
 
 set -euo pipefail
@@ -68,7 +69,7 @@ RADIO_DEV="${RADIO_DEV:-}"
 #
 # Worth raising: at 57600 a full 1500-byte packet takes 260 ms just to clock
 # into the radio, which is felt directly as SSH lag. 115200 halves that, 230400
-# quarters it, and the 250 kbps air rate can absorb either.
+# quarters it, and the 224 kbps air rate can absorb either.
 RADIO_BAUD="${RADIO_BAUD:-57600}"
 
 # `nocrtscts` by default because the RFD900x ships with RTS/CTS *disabled*
@@ -94,6 +95,25 @@ LCP_FAILURE="${LCP_FAILURE:-6}"
 
 # Seconds between redial attempts once the link is down.
 HOLDOFF="${HOLDOFF:-5}"
+
+# Largest IP packet the PPP link sends (MTU) and accepts (MRU), in bytes.
+# Smaller packets mean less air time is lost when the radio drops a frame, but
+# more header overhead per byte of payload. Each side's MRU limits what the
+# other side sends, so set the same values on both Pis.
+PPP_MTU="${PPP_MTU:-576}"
+PPP_MRU="${PPP_MRU:-$PPP_MTU}"
+
+# MTU of tailscaled's tailscale0 interface, set through TS_DEBUG_MTU in a
+# systemd drop-in. Every tunnel packet gets 60 bytes of wrapping (20 IPv4 + 8
+# UDP + 32 WireGuard), so the default is the largest size that still fits in
+# one PPP frame, min(PPP_MTU, PPP_MRU) - 60, capped at Tailscale's own 1280
+# default. Empty means use that default. Only matters here if this Pi's own
+# tailnet traffic is sent to the buoy over the radio; Tailscale traffic from
+# this Pi to the internet goes out over ethernet.
+TS_MTU="${TS_MTU:-}"
+SET_TS_MTU="${SET_TS_MTU:-yes}"
+WG_OVERHEAD=60
+TS_DROPIN="/etc/systemd/system/tailscaled.service.d/smores-radio-mtu.conf"
 
 NFT_FILE="/etc/nftables.d/smores-radio-nat.nft"
 SYSCTL_FILE="/etc/sysctl.d/99-smores-radio-forward.conf"
@@ -135,8 +155,17 @@ Options:
                           crtscts requires ATS14=1 on BOTH radios
       --shore-ip ADDR     This Pi's address on the link   (default: $SHORE_IP)
       --buoy-ip ADDR      The buoy's address on the link  (default: $BUOY_IP)
+      --mtu BYTES         PPP MTU; match the buoy side    (default: $PPP_MTU)
+      --mru BYTES         PPP MRU; match the buoy side    (default: same as --mtu)
+      --tailscale-mtu BYTES
+                          tailscaled TS_DEBUG_MTU         (default: smaller of
+                                                          MTU/MRU minus $WG_OVERHEAD, max 1280)
+      --no-tailscale-mtu  Leave tailscaled's MTU alone
   -s, --status            Show link and NAT state, then exit
-  -r, --remove            Tear the whole thing back down
+  -r, --remove            Tear the whole thing back down, including
+                          tailscaled's MTU
+      --remove-tailscale-mtu
+                          Only restore tailscaled's default MTU
   -h, --help              This message
 
 Must be run as root, except for --status.
@@ -152,8 +181,13 @@ while [ $# -gt 0 ]; do
         --flow-control)   FLOW_CONTROL="${2:?--flow-control needs a value}"; shift 2 ;;
         --shore-ip)       SHORE_IP="${2:?--shore-ip needs a value}"; shift 2 ;;
         --buoy-ip)        BUOY_IP="${2:?--buoy-ip needs a value}"; shift 2 ;;
+        --mtu)            PPP_MTU="${2:?--mtu needs a value}"; shift 2 ;;
+        --mru)            PPP_MRU="${2:?--mru needs a value}"; shift 2 ;;
+        --tailscale-mtu)  TS_MTU="${2:?--tailscale-mtu needs a value}"; SET_TS_MTU="yes"; shift 2 ;;
+        --no-tailscale-mtu) SET_TS_MTU="no"; shift ;;
         -s|--status)      ACTION="status"; shift ;;
         -r|--remove)      ACTION="remove"; shift ;;
+        --remove-tailscale-mtu) ACTION="remove-ts-mtu"; shift ;;
         -h|--help)        usage; exit 0 ;;
         *)                usage >&2; die "unknown argument: $1" ;;
     esac
@@ -195,6 +229,30 @@ validate_args() {
         *%*|*[[:space:]]*) die "$RADIO_DEV contains % or whitespace; use a path without them" ;;
     esac
     [ -e "$RADIO_DEV" ] || warn "$RADIO_DEV does not exist yet; the service will wait for it."
+    validate_mtu
+}
+
+is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; }
+
+# Also fills in the default TS_MTU, which depends on the PPP values.
+validate_mtu() {
+    local opt val
+    for opt in mtu:"$PPP_MTU" mru:"$PPP_MRU"; do
+        val="${opt#*:}"
+        { is_uint "$val" && [ "$val" -ge 128 ] && [ "$val" -le 1500 ]; } \
+            || die "--${opt%%:*} must be a whole number of bytes from 128 to 1500 (got '$val')"
+    done
+    local ppp_min=$(( PPP_MTU < PPP_MRU ? PPP_MTU : PPP_MRU ))
+    if [ -z "$TS_MTU" ]; then
+        TS_MTU=$(( ppp_min - WG_OVERHEAD ))
+        [ "$TS_MTU" -le 1280 ] || TS_MTU=1280
+    fi
+    { is_uint "$TS_MTU" && [ "$TS_MTU" -ge 68 ]; } \
+        || die "--tailscale-mtu must be a whole number of bytes, at least 68 (got '$TS_MTU')"
+    [ $(( TS_MTU + WG_OVERHEAD )) -le "$ppp_min" ] \
+        || warn "Tailscale MTU $TS_MTU + $WG_OVERHEAD bytes of tunnel overhead exceeds the PPP MTU/MRU $ppp_min; every full-size tunnel packet will be fragmented."
+    [ "$TS_MTU" -ge 1280 ] \
+        || warn "Tailscale MTU $TS_MTU is below 1280: IPv6 inside the tailnet stops working (IPv4 100.x addresses are fine)."
 }
 
 require_root() {
@@ -308,15 +366,16 @@ ExecStart=/usr/sbin/pppd $RADIO_DEV $RADIO_BAUD \\
 # This Pi's default route belongs to the campus ethernet; never let the radio
 # link take it.
     nodefaultroute \\
-# RTS/CTS. The RFD900x ships with it off (ATS14=0), and waiting on a CTS that
-# never comes wedges the port silently. crtscts needs ATS14=1 on BOTH radios.
+# RTS/CTS. The RFD900x ships with it off (ATS13=0), and waiting on a CTS that
+# never comes wedges the port silently. crtscts needs ATS13=1 on BOTH radios.
     $FLOW_CONTROL \\
 # The radio is an 8-bit clean pipe; don't spend air time escaping control
 # characters.
     asyncmap 0 \\
-# Keep 1500. Tailscale's 1280-byte WireGuard packets plus UDP/IP headers must
-# fit in one PPP frame; over a lossy radio, one lost fragment loses the packet.
-    mtu 1500 mru 1500 \\
+# PPP_MTU / PPP_MRU. tailscaled's MTU is set $WG_OVERHEAD bytes smaller (see
+# $TS_DROPIN) so each tunnel packet fits in one PPP frame; over a lossy radio,
+# losing one fragment loses the whole packet.
+    mtu $PPP_MTU mru $PPP_MRU \\
 # Campus egress here is v4-only, so skip IPV6CP negotiation entirely.
     noipv6 \\
 # lcp-echo-* is the only thing that notices a *silent* failure: RF noise, the
@@ -379,6 +438,11 @@ do_apply() {
     note "Give the link ~30 s to negotiate, then: sudo $0 --status"
     printf '\n'
     do_status || true
+
+    # Last, because the tailscaled restart may drop a Tailscale SSH session.
+    # Revert with --remove-tailscale-mtu.
+    printf '\n'
+    configure_tailscale_mtu
 }
 
 # ----------------------------------------------------------------- status --
@@ -395,6 +459,14 @@ do_status() {
     else
         warn "  none — the link is down"
         rc=1
+    fi
+
+    note "MTUs:"
+    ip -oneline link show 2>/dev/null | awk '$2 ~ /^(ppp|tailscale)/ { sub(":", "", $2); print "  " $2 " mtu " $5 }' || true
+    if [ -f "$TS_DROPIN" ]; then
+        grep -h 'TS_DEBUG_MTU' "$TS_DROPIN" | sed "s|^|  $TS_DROPIN: |"
+    else
+        note "  tailscaled is using its default MTU (no $TS_DROPIN)"
     fi
 
     note "IPv4 forwarding: $(cat /proc/sys/net/ipv4/ip_forward)"
@@ -432,11 +504,58 @@ do_remove() {
     rm -f "$NFT_FILE" "$SYSCTL_FILE"
     nft delete table ip smores_nat 2>/dev/null || true
     systemctl daemon-reload
+    restore_tailscale_mtu
     # ip_forward is left as-is in the running kernel: the sysctl.d file that set
     # it is gone, so it reverts on the next boot. Flipping it off now could cut
     # forwarding that something else on this Pi depends on.
     ok "Removed the shore-side radio link, its NAT table and its units."
     note "net.ipv4.ip_forward stays 1 until the next reboot."
+}
+
+# ---------------------------------------------------------- tailscale MTU --
+#
+# The same thing as `systemctl edit tailscaled` with
+#   [Service]
+#   Environment=TS_DEBUG_MTU=<n>
+# but in a drop-in file of its own instead of override.conf, so reverting it
+# never touches edits anyone made by hand. Revert with --remove-tailscale-mtu
+# (or --remove), or by hand:
+#   sudo rm $TS_DROPIN
+#   sudo systemctl daemon-reload && sudo systemctl restart tailscaled
+#
+# The restart is queued with --no-block and done last. If this script is run
+# over a Tailscale SSH session, that session drops for a few seconds while
+# tailscaled restarts, and the script must not be in the middle of anything.
+
+configure_tailscale_mtu() {
+    [ "$SET_TS_MTU" = "yes" ] || { note "Leaving tailscaled's MTU alone (--no-tailscale-mtu)."; return 0; }
+    if ! systemctl cat tailscaled.service >/dev/null 2>&1; then
+        warn "tailscaled.service is not installed, so its MTU was not set. Re-run"
+        warn "this script after installing Tailscale."
+        return 0
+    fi
+
+    local want
+    want="$(printf '# Managed by deploy/%s. Revert with: sudo %s --remove-tailscale-mtu\n[Service]\nEnvironment=TS_DEBUG_MTU=%s\n' "$PROG" "$0" "$TS_MTU")"
+    if [ -f "$TS_DROPIN" ] && [ "$(cat "$TS_DROPIN")" = "$want" ]; then
+        note "tailscaled MTU is already $TS_MTU ($TS_DROPIN)."
+        return 0
+    fi
+
+    install -d -m 0755 "${TS_DROPIN%/*}"
+    printf '%s\n' "$want" >"$TS_DROPIN"
+    systemctl daemon-reload
+    note "Wrote $TS_DROPIN (TS_DEBUG_MTU=$TS_MTU); restarting tailscaled if it is running."
+    systemctl --no-block try-restart tailscaled.service
+}
+
+restore_tailscale_mtu() {
+    [ -f "$TS_DROPIN" ] || { note "tailscaled MTU was not changed by this script; nothing to revert."; return 0; }
+    rm -f "$TS_DROPIN"
+    rmdir "${TS_DROPIN%/*}" 2>/dev/null || true
+    systemctl daemon-reload
+    note "Deleted $TS_DROPIN; restarting tailscaled with its default MTU if it is running."
+    systemctl --no-block try-restart tailscaled.service
 }
 
 # ------------------------------------------------------------------- main --
@@ -445,4 +564,5 @@ case "$ACTION" in
     status) do_status ;;
     apply)  require_root "$@"; do_apply ;;
     remove) require_root "$@"; do_remove ;;
+    remove-ts-mtu) require_root "$@"; restore_tailscale_mtu ;;
 esac
