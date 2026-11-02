@@ -8,10 +8,11 @@ vendor-doc correction is a one-line patch there rather than a change here.
 
 import asyncio
 import logging
-import struct
 import time
 from collections.abc import Sequence
-from typing import Final
+from typing import Final, Literal
+
+from pymodbus.client.mixin import ModbusClientMixin
 
 from constants import (
     PARAMETER_TIMEOUT_STATUS_CODE,
@@ -91,18 +92,31 @@ def _severity_rank(code: int) -> int:
     return 100 + code
 
 
+_WORD_ORDER: Final[Literal["big", "little"]] = (
+    "big" if MULTI_REGISTER_WORD_ORDER_BIG_ENDIAN else "little"
+)
+"""Word order handed to pymodbus's decoder for every multi-register value."""
+
+
+def _decode(registers: Sequence[int], data_type: ModbusClientMixin.DATATYPE) -> int | float:
+    """Decode the leading registers of `registers` as one `data_type` value
+    via pymodbus's `convert_from_registers` (the successor to the removed
+    `pymodbus.payload.BinaryPayloadDecoder.fromRegisters`). Only the first
+    `data_type`-sized slice is decoded, so callers may pass a whole parameter
+    block."""
+    width = data_type.value[1]
+    words = [register & 0xFFFF for register in registers[:width]]
+    value = ModbusClientMixin.convert_from_registers(words, data_type, word_order=_WORD_ORDER)
+    assert isinstance(value, int | float)
+    return value
+
+
 def _registers_to_uint32(registers: Sequence[int]) -> int:
-    high, low = registers[0] & 0xFFFF, registers[1] & 0xFFFF
-    if not MULTI_REGISTER_WORD_ORDER_BIG_ENDIAN:
-        high, low = low, high
-    return (high << 16) | low
+    return int(_decode(registers, ModbusClientMixin.DATATYPE.UINT32))
 
 
 def _registers_to_float32(registers: Sequence[int]) -> float:
-    high, low = registers[0] & 0xFFFF, registers[1] & 0xFFFF
-    if not MULTI_REGISTER_WORD_ORDER_BIG_ENDIAN:
-        high, low = low, high
-    return float(struct.unpack(">f", struct.pack(">HH", high, low))[0])
+    return float(_decode(registers, ModbusClientMixin.DATATYPE.FLOAT32))
 
 
 class BlueRDOSensor(BlueRDOInterface):

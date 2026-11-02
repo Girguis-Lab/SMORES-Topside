@@ -4,7 +4,7 @@ url = "https://pypi.org/simple"
 verify_ssl = true
 
 [packages]
-pymodbus = ">=3.6"
+pymodbus = ">=3.6,<4.0"
 pyserial-asyncio = "*"
 aiosqlite = "*"
 pydantic = ">=2,<3"
@@ -12,6 +12,7 @@ aiohttp = "*"
 aiohttp-apigami = "*"
 marshmallow = "*"
 psutil = "*"
+mpy-cross = "*"
 
 [dev-packages]
 pytest = "*"
@@ -21,6 +22,7 @@ freezegun = "*"
 mypy = "*"
 ruff = "*"
 types-psutil = "*"
+modbus-cli = "*"
 
 [requires]
 python_version = "3.13"

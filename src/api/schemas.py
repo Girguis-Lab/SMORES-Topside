@@ -211,6 +211,55 @@ class DataRangeQuerySchema(Schema):
     )
 
 
+class CurrentReadingsQuerySchema(Schema):
+    """Optional flags for `GET /api/sensors/current`."""
+
+    class Meta:
+        unknown = EXCLUDE
+
+    save = fields.Boolean(
+        load_default=False,
+        metadata={
+            "description": (
+                "If true, also insert the polled readings into the DB (one row per "
+                "sensor, as the periodic sampler does); returned rows then carry "
+                "their row_id."
+            )
+        },
+    )
+
+
+class ScanQuerySchema(Schema):
+    """Optional inclusive address range for `GET /api/scan`. Either bound
+    left out falls back to the saved `scan_min_address`/`scan_max_address`."""
+
+    class Meta:
+        unknown = EXCLUDE
+
+    start_address = fields.Integer(
+        load_default=None,
+        allow_none=True,
+        validate=validate.Range(min=MODBUS_MIN_UNIT_ADDRESS, max=MODBUS_MAX_UNIT_ADDRESS),
+        metadata={
+            "description": (
+                "Lowest Modbus address to probe (inclusive). Saved to config as "
+                "scan_min_address."
+            )
+        },
+    )
+    stop_address = fields.Integer(
+        load_default=None,
+        allow_none=True,
+        validate=validate.Range(min=MODBUS_MIN_UNIT_ADDRESS, max=MODBUS_MAX_UNIT_ADDRESS),
+        metadata={
+            "description": (
+                "Highest Modbus address to probe (inclusive). Saved to config as "
+                "scan_max_address."
+            )
+        },
+    )
+
+
 class DataDeleteQuerySchema(Schema):
     """Required cutoff for `DELETE /api/data`."""
 

@@ -213,9 +213,9 @@ class ModbusBus:
         soon as it is answered or times out, *without* waiting the
         instrument's settle time.
 
-        Callers that wake many addresses in bulk (`hardware.manager`'s scan)
-        use this plus a single `wakeup_settle_seconds` sleep, instead of
-        paying that settle per address. A wake-up going unanswered is normal
+        `_ensure_awake` pairs this with the `wakeup_settle_seconds` sleep;
+        it is public so a caller can manage that settle itself. A wake-up
+        going unanswered is normal
         and not an error — the vendor doc's whole point is that the
         instrument may not answer until it has woken up.
         """
@@ -238,10 +238,10 @@ class ModbusBus:
         """Check whether a sensor is present at Modbus unit `address` on
         this bus, used by `hardware.manager.scan_all_buses`.
 
-        Does *not* wake `address` first: a scan probes hundreds of addresses,
-        so `hardware.manager` wakes them in bulk via `wake_address` and
-        re-probes non-answerers once, rather than paying
-        `wakeup_settle_seconds` per address here.
+        Does *not* wake `address` first: `hardware.manager`'s scan treats
+        the first probe as the wake-up and, only if it goes unanswered,
+        waits `wakeup_settle_seconds` and re-probes, so a present, awake
+        sensor costs a single round trip.
 
         Args:
             address: Modbus unit/slave address to probe.

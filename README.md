@@ -306,16 +306,17 @@ with `GET /api/scan`.
 With `scan_on_startup: true`, startup probes every Modbus address in
 `[scan_min_address, scan_max_address]` on every converter. An address with
 nothing on it can only be ruled out by letting its probe time out, and each
-address is probed up to twice (the first probe doubles as the instrument
-wake-up the vendor doc requires). So the worst case is roughly:
+address is scanned in turn and probed up to twice (the first probe doubles as
+the instrument wake-up the vendor doc requires, followed by a 1 s settle
+before the second). So the worst case is roughly:
 
 ```
-2 x (scan_max_address - scan_min_address + 1) x scan_probe_timeout_seconds
+(scan_max_address - scan_min_address + 1) x (2 x scan_probe_timeout_seconds + 1 s)
 ```
 
-The defaults (`1`-`247`, 1 s) therefore allow up to ~8 minutes. Set
+The defaults (`1`-`247`, 1 s) therefore allow up to ~12 minutes. Set
 `scan_max_address` to the highest address actually installed — e.g. `27` for
-a 27-sensor array, which brings the same scan down to under a minute — or
+a 27-sensor array, which brings the same scan down to under ~1.5 minutes — or
 leave `scan_on_startup: false` and let the saved `sensor_mapping` be used
 as-is, re-scanning on demand with `GET /api/scan`. The startup log states
 the address count and the worst-case estimate, and warns when that estimate
@@ -687,17 +688,28 @@ page at `http://localhost:8080/` links to the docs.
 | --- | --- |
 | `GET /` | HTML overview page, links to the docs |
 | `GET /api/docs` | Swagger UI |
-| `GET /api/sensors/current` | Fresh poll of every configured sensor; does **not** write a DB row |
+| `GET /api/sensors/current` | Fresh poll of every configured sensor; writes no DB row unless `save=true` |
 | `GET /api/data` | Stored readings as JSON; optional `start`/`end` |
 | `GET /api/data/csv` | The same rows, CSV |
 | `DELETE /api/data` | Delete rows older than a required `cutoff` |
 | `GET /api/config` | Current `config.json` contents |
 | `PUT /api/config` | Validate and persist a new config, then restart the process |
-| `GET /api/scan` | Re-scan every converter, save the mapping to `config.json`, return it |
+| `GET /api/scan` | Re-scan every converter, save the mapping to `config.json`, return it; optional `start_address`/`stop_address` |
 
 `start`, `end`, and `cutoff` are UTC unix timestamps in seconds (fractional
 allowed). `start`/`end` are both **inclusive**; `cutoff` is **exclusive** —
 `DELETE` removes rows with `timestamp_utc < cutoff`.
+
+`GET /api/sensors/current?save=true` also stores the poll in the DB (one row
+per sensor, exactly like a scheduled sample) and returns each reading with
+its new `row_id`.
+
+`GET /api/scan?start_address=1&stop_address=27` limits the scan to that
+inclusive Modbus address range (1–247). Either bound may be given alone; the
+other defaults to the saved `scan_min_address`/`scan_max_address`. After a
+successful scan both bounds are saved to `config.json` as
+`scan_min_address`/`scan_max_address`, next to the new `sensor_mapping`, so
+later scans (including the startup scan) use the same range.
 
 ### CSV export for a date range
 
@@ -728,7 +740,9 @@ curl -s http://localhost:8080/api/config > my_config.json
 curl -s -X PUT -H 'Content-Type: application/json' \
   --data @my_config.json http://localhost:8080/api/config      # restarts the process
 curl -s -X DELETE "http://localhost:8080/api/data?cutoff=$(date -u -d '30 days ago' +%s)"
+curl -s "http://localhost:8080/api/sensors/current?save=true"   # poll and store
 curl -s http://localhost:8080/api/scan | python3 -m json.tool   # can take minutes
+curl -s "http://localhost:8080/api/scan?start_address=1&stop_address=27"   # narrower, faster
 ```
 
 ### CSV output format
@@ -744,7 +758,7 @@ row_id,sensor_address,serial_converter_id,timestamp_utc,temperature_c,do_percent
 
 | Column | Meaning |
 | --- | --- |
-| `row_id` | Monotonically incrementing DB row counter (`INTEGER PRIMARY KEY AUTOINCREMENT`); empty for `/api/sensors/current`, which doesn't store a row |
+| `row_id` | Monotonically incrementing DB row counter (`INTEGER PRIMARY KEY AUTOINCREMENT`); empty for `/api/sensors/current` unless called with `save=true` |
 | `sensor_address` | The sensor's globally unique Modbus address |
 | `serial_converter_id` | `/dev/serial/by-id/...` path of the converter it was read through |
 | `timestamp_utc` | Unix epoch seconds, UTC, when the reading was taken |
@@ -787,10 +801,10 @@ than as a gap.
 | Code | When |
 | --- | --- |
 | `200` | Success |
-| `400` | Bad query parameter (`start`/`end`/`cutoff` not a number, `cutoff` missing) or a `PUT /api/config` body that fails schema validation. Body is `{"error": ..., "detail": ...}` |
+| `400` | Bad query parameter (`start`/`end`/`cutoff` not a number, `cutoff` missing, `save` not a boolean, `start_address`/`stop_address` outside 1–247 or start > stop) or a `PUT /api/config` body that fails schema validation. Body is `{"error": ..., "detail": ...}` |
 | `404` / `405` | Unknown path / wrong method for that path |
 | `500` | Internal error (also returned if `config.json` can't be written) |
-| `503` | Either **at capacity** — more than `api_max_concurrent_clients` (default 5) requests in flight, with a `Retry-After: 1` header, never queued — or **not ready**: `/api/sensors/current` and `/api/scan` while a bus scan is in progress or before the sensor mapping is established. The `error` field distinguishes them |
+| `503` | Either **at capacity** — more than `api_max_concurrent_clients` (default 5) requests in flight, with a `Retry-After: 1` header, never queued — or **not ready**: `/api/sensors/current` and `/api/scan` while a bus scan is in progress or before the sensor mapping is established (a `/api/scan` for the *same* range as the running scan waits for it instead; a different range gets `503`). The `error` field distinguishes them |
 | `504` | The handler exceeded its timeout: `poll_timeout_seconds` for `/api/sensors/current`, the scan worst-case estimate for `/api/scan`, `api_request_timeout_seconds` for everything else |
 
 ## Development

@@ -26,9 +26,11 @@ from pydantic import ValidationError as PydanticValidationError
 from api.middleware import with_timeout
 from api.schemas import (
     ConfigSchema,
+    CurrentReadingsQuerySchema,
     DataDeleteQuerySchema,
     DataRangeQuerySchema,
     ErrorSchema,
+    ScanQuerySchema,
     ScanResultSchema,
     SensorReadingSchema,
 )
@@ -38,6 +40,7 @@ from constants import BusScanError, ConfigValidationError
 from db.database import Database
 from hardware.manager import SensorManager, estimate_scan_duration_seconds
 from models.readings import SensorReading
+from sampler import sample_once
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +57,8 @@ over one or more RS485-to-USB converters, saves readings to SQLite on a
 timer, and serves them over this HTTP API.</p>
 <ul>
 <li><a href="/api/docs">API documentation (Swagger UI)</a></li>
-<li><a href="/api/sensors/current">GET /api/sensors/current</a> — fresh sensor poll</li>
+<li><a href="/api/sensors/current">GET /api/sensors/current</a> — fresh sensor poll
+(add <code>?save=true</code> to also store it)</li>
 <li><a href="/api/data">GET /api/data</a> — stored readings</li>
 <li><a href="/api/config">GET /api/config</a> — current configuration</li>
 </ul>
@@ -91,7 +95,9 @@ async def index(request: web.Request) -> web.Response:
     summary="Fresh sensor poll",
     description=(
         "Triggers a fresh, lock-guarded poll of every configured sensor via "
-        "hardware.manager.query_all_sensors(). Does not write a DB row. "
+        "hardware.manager.query_all_sensors(). Writes no DB row unless "
+        "save=true, in which case one row per sensor is stored (as the periodic "
+        "sampler does) and each returned reading carries its row_id. "
         "Unreachable sensors are still included, with -9999 fields and a "
         "non-OK status. Bounded by config.poll_timeout_seconds."
     ),
@@ -100,21 +106,36 @@ async def index(request: web.Request) -> web.Response:
             "schema": SensorReadingSchema(many=True),
             "description": "One reading per configured sensor.",
         },
+        400: {"schema": ErrorSchema, "description": "Invalid save query parameter."},
         503: {"schema": ErrorSchema, "description": "A bus scan is currently in progress."},
         504: {"schema": ErrorSchema, "description": "Poll exceeded poll_timeout_seconds."},
     },
 )
+@querystring_schema(CurrentReadingsQuerySchema)
 async def get_current_readings(request: web.Request) -> web.Response:
     """`GET /api/sensors/current` — lock-guarded fresh poll of every
     configured sensor via `hardware.manager.SensorManager.query_all_sensors()`.
-    Does not write a DB row. Returns the same JSON shape as a stored row,
-    including `constants.UNREADABLE_VALUE`/error status for unreachable
-    sensors. Bounded by `config.poll_timeout_seconds`
-    (`api.middleware.with_timeout`); exceeding it yields `504`.
+    Returns the same JSON shape as a stored row, including
+    `constants.UNREADABLE_VALUE`/error status for unreachable sensors.
+    Bounded by `config.poll_timeout_seconds` (`api.middleware.with_timeout`);
+    exceeding it yields `504`.
+
+    Query params:
+        save: optional bool (default false); if true, the readings are also
+            inserted into the DB via `sampler.sample_once`, the same path the
+            periodic sampler uses, and returned with their `row_id`s.
     """
     manager: SensorManager = request.app["manager"]
     try:
-        readings = await manager.query_all_sensors()
+        query = CurrentReadingsQuerySchema().load(request.query)
+    except ValidationError as exc:
+        return _validation_error_response(exc)
+    try:
+        if query["save"]:
+            database: Database = request.app["database"]
+            readings = await sample_once(manager, database)
+        else:
+            readings = await manager.query_all_sensors()
     except BusScanError as exc:
         return _error_response(503, "Bus scan in progress", str(exc))
     return web.json_response(_dump_readings(readings))
@@ -280,42 +301,76 @@ async def put_config(request: web.Request) -> web.Response:
         "Scans every configured RS485-to-USB converter's Modbus address "
         "space for present sensors, persists the resulting mapping to "
         "config.json (overwriting any existing sensor_mapping), and "
-        "returns it. Same underlying scan used at startup."
+        "returns it. Same underlying scan used at startup. Optional "
+        "start_address/stop_address narrow or widen the probed range and are "
+        "saved as scan_min_address/scan_max_address alongside the mapping; "
+        "a bound left out uses the saved value."
     ),
     responses={
         200: {
             "schema": ScanResultSchema(many=True),
             "description": "One result per configured converter.",
         },
+        400: {
+            "schema": ErrorSchema,
+            "description": (
+                "Invalid start_address/stop_address, or start_address > stop_address "
+                "once defaults are applied."
+            ),
+        },
         503: {
             "schema": ErrorSchema,
-            "description": "A scan is already in progress, or a converter is unusable.",
+            "description": (
+                "A scan of a different range is already in progress, or a "
+                "converter is unusable."
+            ),
         },
         504: {
             "schema": ErrorSchema,
             "description": (
-                "Scan exceeded its worst-case duration "
+                "Scan exceeded its worst-case duration for the requested range "
                 "(hardware.manager.estimate_scan_duration_seconds)."
             ),
         },
     },
 )
+@querystring_schema(ScanQuerySchema)
 async def scan_buses(request: web.Request) -> web.Response:
     """`GET /api/scan` — scan every configured converter for present
     Modbus addresses via `hardware.manager.SensorManager.scan_all_buses()`,
     persist the resulting mapping to `config.json` (overwriting any
     existing `sensor_mapping`), and return it. Bounded by
-    `hardware.manager.estimate_scan_duration_seconds(config)`.
+    `hardware.manager.estimate_scan_duration_seconds` for the scanned range
+    (`_scan_timeout_seconds`).
+
+    Query params:
+        start_address, stop_address: optional inclusive address range; each
+            defaults to the saved `scan_min_address`/`scan_max_address`.
+            Saved back to those fields after a successful scan.
     """
     manager: SensorManager = request.app["manager"]
     config: Config = request.app["config"]
     data_dir: Path = request.app["data_dir"]
 
     try:
-        results = await manager.scan_all_buses()
+        min_address, max_address = _scan_range(request, config)
+    except ValidationError as exc:
+        return _validation_error_response(exc)
+    if min_address > max_address:
+        return _error_response(
+            400,
+            "Invalid request parameters",
+            f"start_address ({min_address}) must be <= stop_address ({max_address}); "
+            "a bound left out defaults to the saved scan_min_address/scan_max_address",
+        )
+
+    try:
+        results = await manager.scan_all_buses(min_address, max_address)
     except BusScanError as exc:
         return _error_response(503, "Bus scan failed", str(exc))
 
+    config.scan_min_address = min_address
+    config.scan_max_address = max_address
     config.sensor_mapping = manager.get_sensor_mapping()
     try:
         save_config(config, get_config_path(data_dir))
@@ -327,17 +382,49 @@ async def scan_buses(request: web.Request) -> web.Response:
     return web.json_response(schema.dump([result.model_dump() for result in results]))
 
 
+def _scan_range(request: web.Request, config: Config) -> tuple[int, int]:
+    """`/api/scan`'s requested (min, max) address range, with each bound
+    left out defaulting to the saved config value.
+
+    Raises:
+        marshmallow.ValidationError: a bound is not an integer in the legal
+            Modbus address range.
+    """
+    query = ScanQuerySchema().load(request.query)
+    start: int | None = query["start_address"]
+    stop: int | None = query["stop_address"]
+    return (
+        config.scan_min_address if start is None else start,
+        config.scan_max_address if stop is None else stop,
+    )
+
+
+def _scan_timeout_seconds(request: web.Request) -> float:
+    """Per-request `/api/scan` timeout: the worst-case duration of the
+    range this request will scan. An unparsable range falls back to the
+    saved range — the handler rejects it with a 400 straight away anyway,
+    which a 0s timeout for an inverted range would preempt with a 504."""
+    config: Config = request.app["config"]
+    try:
+        min_address, max_address = _scan_range(request, config)
+    except ValidationError:
+        return estimate_scan_duration_seconds(config)
+    if min_address > max_address:
+        return estimate_scan_duration_seconds(config)
+    return estimate_scan_duration_seconds(config, min_address, max_address)
+
+
 def register_routes(app: web.Application) -> None:
     """Add every route above to `app`, called once by `api.app.create_app`.
 
     `/api/sensors/current` and `/api/scan` get a per-route timeout override
-    (`poll_timeout_seconds`, and the scan's worst-case duration from
-    `hardware.manager.estimate_scan_duration_seconds`)
-    applied via a direct `with_timeout(...)` call against the live `Config`
-    on `app`, rather than a `@with_timeout(...)` decorator above the `def` —
-    the override value depends on the config loaded at process startup,
-    which isn't available yet when this module (and its decorators) are
-    first imported.
+    (`poll_timeout_seconds`, and the requested scan range's worst-case
+    duration via `_scan_timeout_seconds`) applied via a direct
+    `with_timeout(...)` call at registration, rather than a
+    `@with_timeout(...)` decorator above the `def` — the override depends on
+    the config loaded at process startup (and, for the scan, on each
+    request's query params), none of which exist when this module (and its
+    decorators) are first imported.
     """
     config: Config = app["config"]
 
@@ -352,8 +439,7 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/config", get_config)
     app.router.add_put("/api/config", put_config)
 
-    # A scan probes every address in [scan_min_address, scan_max_address] up to
-    # twice, and each absent address costs a full probe timeout, so the old
-    # `probe_timeout * num_converters` budget could never cover a real scan.
-    scan_timeout = estimate_scan_duration_seconds(config)
-    app.router.add_get("/api/scan", with_timeout(scan_timeout)(scan_buses))
+    # A scan probes every address in its range in turn, and each absent
+    # address costs two probe timeouts plus a wake-up settle, so a
+    # `probe_timeout * num_converters` budget could never cover it.
+    app.router.add_get("/api/scan", with_timeout(_scan_timeout_seconds)(scan_buses))

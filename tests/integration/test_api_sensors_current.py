@@ -66,6 +66,54 @@ async def test_does_not_write_a_db_row(
     assert await database.count_rows() == 0
 
 
+@pytest.mark.parametrize("value", ["false", "0"])
+async def test_save_false_does_not_write_a_db_row(
+    aiohttp_client: AiohttpClient, app: web.Application, database: Database, value: str
+) -> None:
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/api/sensors/current", params={"save": value})
+
+    assert resp.status == 200
+    assert await database.count_rows() == 0
+
+
+async def test_save_true_writes_one_row_per_sensor_and_returns_row_ids(
+    aiohttp_client: AiohttpClient,
+    app: web.Application,
+    database: Database,
+    mock_sensors: dict[int, MockBlueRDOSensor],
+) -> None:
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/api/sensors/current", params={"save": "true"})
+
+    assert resp.status == 200
+    body = await resp.json()
+    assert len(body) == len(mock_sensors)
+    assert all(row["row_id"] is not None for row in body)
+
+    stored = await database.get_readings()
+    assert {reading.row_id for reading in stored} == {row["row_id"] for row in body}
+    by_address = {reading.sensor_address: reading for reading in stored}
+    for row in body:
+        saved = by_address[row["sensor_address"]]
+        assert saved.temperature_c == pytest.approx(row["temperature_c"])
+        assert saved.timestamp_utc == pytest.approx(row["timestamp_utc"])
+
+
+async def test_save_with_an_invalid_value_returns_400(
+    aiohttp_client: AiohttpClient, app: web.Application, database: Database
+) -> None:
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/api/sensors/current", params={"save": "maybe"})
+
+    assert resp.status == 400
+    assert "error" in await resp.json()
+    assert await database.count_rows() == 0
+
+
 async def test_unreachable_sensor_reports_unreadable_value_and_timeout_status(
     aiohttp_client: AiohttpClient, app: web.Application, mock_sensors: dict[int, MockBlueRDOSensor]
 ) -> None:

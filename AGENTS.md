@@ -64,7 +64,7 @@ The backend should broadly do 3 things, each as its own Python module:
 
 | Purpose                 | Library                                           | Notes                                                        |
 | ----------------------- | ------------------------------------------------- | ------------------------------------------------------------ |
-| Modbus RTU async        | pymodbus (>=3.x)                                  | Native asyncio serial client support                         |
+| Modbus RTU async        | pymodbus (>=3.x)                                  | Native asyncio serial client support; also decodes register words to float32/uint32 via `ModbusClientMixin.convert_from_registers` (the replacement for `BinaryPayloadDecoder.fromRegisters`, removed in pymodbus 3.9); no hand-rolled `struct` decoding |
 | Async serial transport  | pyserial-asyncio                                  | Backing transport for pymodbus                               |
 | Async SQLite            | aiosqlite                                         | Non-blocking DB access in the event loop                     |
 | Config/model validation | pydantic (v2)                                     | Typed config schema, parsing, validation, defaults           |
@@ -90,7 +90,6 @@ Do not proceed to the next step until the user replies with an explicit approval
 10. Implement remaining stubs.
 11. Run the full test suite from clean slate in verbose mode - run it 5 times to verify tests leave no leftovers and are not flaky. Also run unit and integration tests separately from a clean slate to verify unit tests don't depend on integration test state and visa versa.
 12. Write systemd unit with data path env vars set to `~/SMORES_Data`, user pi. Add install & operate instructions to README.md (including systemd install & journalctl usage, Where to find live api docs, Basic API query example for CSV in date range, and csv output format example, status code meanings).
-13. Add a separate service
 
 **Definition of Done:** all tests pass, ruff/mypy clean, `ARCHITECTURE.md` matches implementation, systemd unit installs, runs without exiting and survives `systemctl restart`.
 
